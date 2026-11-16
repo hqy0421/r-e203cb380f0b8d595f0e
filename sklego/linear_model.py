@@ -7,6 +7,7 @@ except ImportError:
 import logging
 from abc import ABC, abstractmethod
 from inspect import signature
+from numbers import Integral
 from warnings import warn
 
 import narwhals.stable.v1 as nw
@@ -15,16 +16,30 @@ from scipy.optimize import minimize
 from scipy.special._ufuncs import expit
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.linear_model._base import LinearClassifierMixin
-from sklearn.multiclass import OneVsOneClassifier, OneVsRestClassifier
+from sklearn.multiclass import (
+    OneVsOneClassifier,
+    OneVsRestClassifier,
+    _fit_ovo_binary,
+    _predict_binary,
+)
 from sklearn.preprocessing import LabelEncoder
-from sklearn.utils import check_X_y
+from sklearn.utils import _safe_indexing
+from sklearn.utils.multiclass import (
+    _ovr_decision_function,
+    check_classification_targets,
+)
+from sklearn.utils.parallel import Parallel, delayed
 from sklearn.utils.validation import (
     FLOAT_DTYPES,
     _check_sample_weight,
     check_is_fitted,
     column_or_1d,
 )
-from sklearn_compat.utils.validation import check_array, validate_data
+from sklearn_compat.utils import get_tags
+from sklearn_compat.utils.metadata_routing import _raise_for_params, process_routing
+from sklearn_compat.utils.validation import validate_data
+
+from sklego.common import as_list
 
 
 class LowessRegression(RegressorMixin, BaseEstimator):
@@ -487,6 +502,218 @@ class DeadZoneRegressor(RegressorMixin, BaseEstimator):
         return self._ALLOWED_EFFECTS
 
 
+def _dataframe_columns(X):
+    """Return the column names of `X` when it is a dataframe, otherwise `None`.
+
+    Works through narwhals, so pandas, Polars and PyArrow dataframes are all
+    recognised without importing any of them.
+    """
+    try:
+        frame = nw.from_native(X, eager_only=True, strict=False)
+    except TypeError:
+        return None
+    if isinstance(frame, nw.DataFrame):
+        return list(frame.columns)
+    return None
+
+
+def _align_dataframe_columns(X, expected_names):
+    """Reorder dataframe columns to `expected_names`, leaving other inputs untouched.
+
+    Raises a `ValueError` when the dataframe does not expose exactly the columns
+    seen during `fit`, mirroring scikit-learn's feature-name validation.
+    """
+    if expected_names is None:
+        return X
+
+    try:
+        frame = nw.from_native(X, eager_only=True, strict=False)
+    except TypeError:
+        return X
+    if not isinstance(frame, nw.DataFrame):
+        return X
+
+    columns = list(frame.columns)
+    expected = list(expected_names)
+
+    if columns == expected:
+        return X
+
+    missing = [name for name in expected if name not in columns]
+    unexpected = [name for name in columns if name not in expected]
+    if not missing and not unexpected:
+        return frame.select(expected).to_native()
+
+    message = "The feature names should match those that were passed during fit.\n"
+    if unexpected:
+        message += "Feature names unseen at fit time:\n"
+        message += "".join(f"- {name}\n" for name in unexpected)
+    if missing:
+        message += "Feature names seen at fit time, yet now missing:\n"
+        message += "".join(f"- {name}\n" for name in missing)
+    raise ValueError(message)
+
+
+def _resolve_sensitive_col_idx(sensitive_cols, *, input_columns, n_features):
+    """Resolve `sensitive_cols` into a single positional index of the original input.
+
+    Exactly one sensitive column must be declared. Values are looked up by name
+    when column names are available (pandas, Polars, PyArrow, ...) and by
+    position for array-like input. A missing declaration, a column that is not
+    present, an out-of-range index, or more than one declared column raises a
+    `ValueError` instead of silently dropping the fairness constraint.
+    """
+    if sensitive_cols is None:
+        raise ValueError(
+            "`sensitive_cols` must be specified, exactly one sensitive column is required. "
+            "When fitting on a dataframe pass a column name, when fitting on an array pass "
+            "a column index."
+        )
+
+    specs = as_list(sensitive_cols)
+
+    if len(specs) == 0:
+        raise ValueError("`sensitive_cols` is empty, exactly one sensitive column is required.")
+
+    if len(specs) > 1:
+        raise ValueError(f"`sensitive_cols` must contain exactly one sensitive column, got {len(specs)}: {specs}.")
+
+    spec = specs[0]
+
+    if isinstance(spec, (bool, np.bool_)):
+        raise ValueError(f"`sensitive_cols` should contain a column name or index, got {spec!r}.")
+
+    if input_columns is not None:
+        if isinstance(spec, str):
+            matches = [i for i, name in enumerate(input_columns) if name == spec]
+            if len(matches) == 0:
+                raise ValueError(f"Sensitive column {spec!r} was not found in the input columns {input_columns}.")
+            if len(matches) > 1:
+                raise ValueError(
+                    f"Sensitive column {spec!r} is ambiguous, it appears {len(matches)} times "
+                    f"in the input columns {input_columns}."
+                )
+            return matches[0]
+
+        if not isinstance(spec, Integral):
+            raise ValueError(
+                f"`sensitive_cols` should contain a column name (str) or a column index (int), got {spec!r}."
+            )
+
+        idx = int(spec)
+        if not 0 <= idx < len(input_columns):
+            raise ValueError(
+                f"Sensitive column index {idx} is out of range for the input with {len(input_columns)} columns."
+            )
+        return idx
+
+    if not isinstance(spec, Integral) or isinstance(spec, (bool, np.bool_)):
+        raise ValueError(
+            "`sensitive_cols` must contain a column index (int) when `X` is an array-like input, "
+            f"got {spec!r}. Column names can only be used with dataframe inputs."
+        )
+
+    idx = int(spec)
+    if not 0 <= idx < n_features:
+        raise ValueError(f"Sensitive column index {idx} is out of range for the input with {n_features} columns.")
+    return idx
+
+
+class _FairOneVsRestClassifier(OneVsRestClassifier):
+    """`OneVsRestClassifier` wrapper used by the fairness classifiers.
+
+    Scikit-learn's one-vs-rest wrapper already passes dataframes through to its
+    sub-estimators, so column names stay available. The only addition here is
+    resetting the input schema on refit: scikit-learn copies
+    `feature_names_in_`/`n_features_in_` from the sub-estimators only when they
+    expose them, which would otherwise leave a stale schema behind when the
+    estimator is re-fitted on a different kind of input.
+    """
+
+    def fit(self, X, y, **fit_params):
+        for attr in ("feature_names_in_", "n_features_in_", "coef_names_"):
+            self.__dict__.pop(attr, None)
+
+        super().fit(X, y, **fit_params)
+
+        if hasattr(self.estimators_[0], "coef_names_"):
+            self.coef_names_ = list(self.estimators_[0].coef_names_)
+        return self
+
+
+class _FairOneVsOneClassifier(OneVsOneClassifier):
+    """`OneVsOneClassifier` that keeps dataframe column names on the way down.
+
+    Scikit-learn's implementation validates `X` - converting dataframes to numpy
+    arrays - before slicing it for the binary sub-estimators. Fairness
+    estimators resolve `sensitive_cols` from the original column names, so this
+    wrapper validates the column names and the number of features without
+    converting the input, and lets every sub-estimator receive the dataframe
+    slice it was fitted on.
+
+    It also exposes `coef_names_` for the underlying binary estimators.
+    """
+
+    def fit(self, X, y, **fit_params):
+        _raise_for_params(fit_params, self, "fit")
+        routed_params = process_routing(self, "fit", **fit_params)
+
+        # Records `feature_names_in_`/`n_features_in_` (and drops a stale schema
+        # on refit) without converting dataframes into numpy arrays.
+        X = validate_data(self, X=X, reset=True, skip_check_array=True)
+        y = column_or_1d(y)
+        check_classification_targets(y)
+
+        self.classes_ = np.unique(y)
+        if len(self.classes_) == 1:
+            raise ValueError("OneVsOneClassifier can not be fit when only one class is present.")
+
+        n_classes = self.classes_.shape[0]
+        estimators_indices = list(
+            zip(
+                *(
+                    Parallel(n_jobs=self.n_jobs)(
+                        delayed(_fit_ovo_binary)(
+                            self.estimator,
+                            X,
+                            y,
+                            self.classes_[i],
+                            self.classes_[j],
+                            fit_params=routed_params.estimator.fit,
+                        )
+                        for i in range(n_classes)
+                        for j in range(i + 1, n_classes)
+                    )
+                )
+            )
+        )
+        self.estimators_ = estimators_indices[0]
+
+        pairwise = get_tags(self.estimator).input_tags.pairwise
+        self.pairwise_indices_ = estimators_indices[1] if pairwise else None
+
+        if hasattr(self.estimators_[0], "coef_names_"):
+            self.coef_names_ = list(self.estimators_[0].coef_names_)
+        return self
+
+    def decision_function(self, X):
+        """Decision function that preserves dataframe inputs for the sub-estimators."""
+        check_is_fitted(self)
+        X = _align_dataframe_columns(X, getattr(self, "feature_names_in_", None))
+        X = validate_data(self, X=X, reset=False, skip_check_array=True)
+
+        indices = self.pairwise_indices_
+        if indices is None:
+            Xs = [X] * len(self.estimators_)
+        else:
+            Xs = [_safe_indexing(X, idx) for idx in indices]
+
+        predictions = np.vstack([est.predict(Xi) for est, Xi in zip(self.estimators_, Xs)]).T
+        confidences = np.vstack([_predict_binary(est, Xi) for est, Xi in zip(self.estimators_, Xs)]).T
+        Y = _ovr_decision_function(predictions, confidences, len(self.classes_))
+        return Y[:, 1] if len(self.classes_) == 2 else Y
+
+
 class _FairClassifier(LinearClassifierMixin, BaseEstimator):
     """Base class for fair classifiers that address sensitive attribute fairness.
 
@@ -502,7 +729,9 @@ class _FairClassifier(LinearClassifierMixin, BaseEstimator):
     Parameters
     ----------
     sensitive_cols : List[str] | List[int] | None, default=None
-        A list of column names or column indexes in the input data that represent sensitive attributes.
+        Exactly one column name (if `X` is a dataframe) or one column index (if `X` is an array-like) that represents
+        the sensitive attribute. The declared column is always used for the fairness constraint. It is also used for
+        prediction when `train_sensitive_cols=True`, and excluded from the prediction design matrix otherwise.
     C : float, default=1.0
         Inverse of regularization strength; must be a positive float. Smaller values specify stronger regularization.
     penalty : Literal["l1", "l2", "none", None], default="l1"
@@ -513,13 +742,23 @@ class _FairClassifier(LinearClassifierMixin, BaseEstimator):
     max_iter : int, default=100
         Maximum number of iterations for the solver.
     train_sensitive_cols : bool, default=False
-        Whether or not to include sensitive columns during training. If False, sensitive columns are removed from the
-        input data during training.
+        Whether or not to include the sensitive column in the design matrix that is used for prediction. The fairness
+        constraint always uses the original sensitive values, regardless of this setting.
 
     Attributes
     ----------
-    sensitive_col_idx_ : array
-        Indices of columns in the input data that correspond to sensitive attributes.
+    sensitive_col_idx_ : list[int]
+        The single positional index of the sensitive column, counted on the original input (all columns, before any
+        column is dropped from the design matrix).
+    sensitive_cols_ : list[str] | list[int]
+        The sensitive column as it was declared: the original column name for dataframe input, otherwise its index.
+    coef_names_ : list[str] | list[int]
+        The original columns that `coef_` corresponds to, in the same order as the coefficients. Dataframe input
+        yields column names, array-like input yields the original column indices.
+    feature_names_in_ : ndarray of shape (n_features_in_,)
+        The column names seen during `fit`. Only defined when `X` is a dataframe.
+    n_features_in_ : int
+        The number of columns of the original input, including the sensitive column when it is not a predictor.
     classes_ : array-like of shape (n_classes,)
         The classes seen at `fit`.
 
@@ -527,6 +766,9 @@ class _FairClassifier(LinearClassifierMixin, BaseEstimator):
     ----
     Subclasses of `_FairClassifier` should implement the `constraints` method to specify fairness constraints.
     This class primarily handles the logistic regression optimization and preprocessing steps.
+
+    The sensitive column, the design matrix used for prediction and `coef_` always refer to the same original
+    columns, with the intercept kept separate in `intercept_`.
 
     `_FairClassifier` should not be used directly; it serves as a base class for fair classification models.
     """
@@ -569,7 +811,8 @@ class _FairClassifier(LinearClassifierMixin, BaseEstimator):
         Raises
         ------
         ValueError
-            If `penalty` is not one of "l1", "l2", "none" or None.
+            If `penalty` is not one of "l1", "l2", "none" or None, or if `sensitive_cols` does not declare exactly
+            one existing column.
         """
         if self.penalty not in self._ALLOWED_PENALTIES:
             raise ValueError(f"penalty should be one of {self._ALLOWED_PENALTIES}, got {self.penalty}")
@@ -580,22 +823,34 @@ class _FairClassifier(LinearClassifierMixin, BaseEstimator):
                 DeprecationWarning,
             )
 
-        self.sensitive_col_idx_ = self.sensitive_cols
-        X = nw.from_native(X, eager_only=True, strict=False)
+        input_columns = self._input_columns(X)
+        X, y = validate_data(self, X=X, y=y, reset=True)
 
-        if isinstance(X, nw.DataFrame):
-            self.sensitive_col_idx_ = [i for i, name in enumerate(X.columns) if name in self.sensitive_cols]
+        # Resolving the column before anything else guarantees that a wrong
+        # declaration raises instead of silently dropping the constraint.
+        sensitive_col_idx = self._resolve_sensitive_col_idx(input_columns)
+        self.sensitive_col_idx_ = [sensitive_col_idx]
+        self.sensitive_cols_ = [input_columns[sensitive_col_idx]] if input_columns is not None else [sensitive_col_idx]
 
-        X, y = check_X_y(X, y, accept_large_sparse=False)
-        sensitive = X[:, self.sensitive_col_idx_]
+        # The fairness constraint always uses the original sensitive values,
+        # regardless of whether the sensitive column is also a predictor.
+        sensitive = X[:, [sensitive_col_idx]]
 
-        if not self.train_sensitive_cols:
-            X = np.delete(X, self.sensitive_col_idx_, axis=1)
+        # `train_sensitive_cols` only decides whether the sensitive column is
+        # part of the design matrix used for prediction. The intercept is kept
+        # separate from the coefficients in `coef_`/`intercept_`.
+        self._design_col_idx_ = [i for i in range(X.shape[1]) if self.train_sensitive_cols or i != sensitive_col_idx]
+        self.coef_names_ = (
+            [input_columns[i] for i in self._design_col_idx_]
+            if input_columns is not None
+            else list(self._design_col_idx_)
+        )
+        X_design = X[:, self._design_col_idx_]
 
         if self.fit_intercept:
-            X = np.c_[np.ones(len(X)), X]
+            X_design = np.c_[np.ones(len(X_design)), X_design]
 
-        if X.shape[1] == 0:
+        if X_design.shape[1] == 0:
             msg = "Cannot fit the model, at least 1 feature(s) is required."
             raise ValueError(msg)
 
@@ -611,8 +866,25 @@ class _FairClassifier(LinearClassifierMixin, BaseEstimator):
                 f" in the data, but the data contains {len(self.classes_)}: {self.classes_}"
             )
 
-        self._solve(sensitive, X, y)
+        self._solve(sensitive, X_design, y)
         return self
+
+    def _input_columns(self, X):
+        """Return the column names of `X` when it is a dataframe, otherwise `None`.
+
+        Column order is the original order of the input; it is used to resolve
+        `sensitive_cols` and to expose which original columns the fitted
+        coefficients correspond to.
+        """
+        return _dataframe_columns(X)
+
+    def _resolve_sensitive_col_idx(self, input_columns):
+        """Resolve `sensitive_cols` into a single positional index of the original input."""
+        return _resolve_sensitive_col_idx(
+            self.sensitive_cols,
+            input_columns=input_columns,
+            n_features=None if input_columns is not None else self.n_features_in_,
+        )
 
     def constraints(self, y_hat, y_true, sensitive, n_obs):
         raise NotImplementedError("subclasses of `_FairClassifier` should implement constraints")
@@ -678,12 +950,37 @@ class _FairClassifier(LinearClassifierMixin, BaseEstimator):
         decision_2d = np.c_[-decision, decision]
         return expit(decision_2d)
 
-    def decision_function(self, X):
-        X = check_array(X)
+    def _prepare_design(self, X):
+        """Validate `X` and return the design matrix that matches `coef_`.
 
-        if not self.train_sensitive_cols:
-            X = np.delete(X, self.sensitive_col_idx_, axis=1)
-        return super().decision_function(X)
+        For dataframe input the columns are reordered to the order seen during
+        `fit` (by column name) before the design columns are selected, so that
+        pandas and Polars inputs do not have to be in the same physical order.
+        Array-like inputs are interpreted positionally, exactly as during `fit`.
+        """
+        check_is_fitted(self, ["coef_", "sensitive_col_idx_"])
+        X = _align_dataframe_columns(X, getattr(self, "feature_names_in_", None))
+        X = validate_data(self, X=X, reset=False)
+        return X[:, self._design_col_idx_]
+
+    def decision_function(self, X):
+        """Predict confidence scores for samples.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            The data to predict. Dataframes may have their columns in a
+            different order than during `fit`; they are aligned by name.
+
+        Returns
+        -------
+        np.ndarray of shape (n_samples,)
+            The signed distance to the decision boundary.
+        """
+        X = self._prepare_design(X)
+        scores = X @ self.coef_.T + self.intercept_
+        scores = np.asarray(scores)
+        return np.reshape(scores, (-1,)) if scores.shape[1] == 1 else scores
 
     def _more_tags(self):
         return {"poor_score": True}
@@ -731,8 +1028,11 @@ class DemographicParityClassifier(LinearClassifierMixin, BaseEstimator):
     covariance_threshold : float | None
         The maximum allowed covariance between the sensitive attributes and the distance to the decision boundary.
         If set to None, no fairness constraint is enforced.
-    sensitive_cols : List[str] | List[int] | None, default=None
-        List of sensitive column names (if X is a dataframe) or a list of column indices (if X is a numpy array).
+    sensitive_cols : str | int | List[str] | List[int] | None, default=None
+        Exactly one sensitive column: a column name if `X` is a dataframe (pandas, Polars, ...) or a column index if
+        `X` is an array. The column is always used for the fairness constraint and is part of the design matrix only
+        when `train_sensitive_cols=True`. A missing or unknown column, or more than one declared column, raises a
+        `ValueError` instead of fitting an unconstrained model.
     C : float, default=1.0
         Inverse of regularization strength; must be a positive float. Like in support vector machines, smaller values
         specify stronger regularization.
@@ -744,11 +1044,24 @@ class DemographicParityClassifier(LinearClassifierMixin, BaseEstimator):
     max_iter : int, default=100
         Maximum number of iterations taken for the solvers to converge.
     train_sensitive_cols : bool, default=False
-        Indicates whether the model should use the sensitive columns in the fit step.
+        Whether or not to include the sensitive column in the design matrix that is used for prediction. The fairness
+        constraint always uses the original sensitive values, regardless of this setting.
     multi_class : Literal["ovr", "ovo"], default="ovr"
         The method to use for multiclass predictions.
     n_jobs : int | None, default=1
         The amount of parallel jobs that should be used to fit the model.
+
+    Attributes
+    ----------
+    classes_ : ndarray of shape (n_classes,)
+        The classes seen at `fit`.
+    n_features_in_ : int
+        The number of columns of the original input, including the sensitive column when it is not a predictor.
+    feature_names_in_ : ndarray of shape (n_features_in_,)
+        The original column names, only defined when `X` is a dataframe.
+    coef_names_ : list[str] | list[int]
+        The original columns that the coefficients of the fitted binary estimators correspond to, in the same order as
+        the coefficients.
 
     Source
     ------
@@ -783,7 +1096,7 @@ class DemographicParityClassifier(LinearClassifierMixin, BaseEstimator):
     """
 
     def __new__(cls, *args, multi_class="ovr", n_jobs=1, **kwargs):
-        multiclass_meta = {"ovr": OneVsRestClassifier, "ovo": OneVsOneClassifier}[multi_class]
+        multiclass_meta = {"ovr": _FairOneVsRestClassifier, "ovo": _FairOneVsOneClassifier}[multi_class]
         return multiclass_meta(_DemographicParityClassifier(*args, **kwargs), n_jobs=n_jobs)
 
 
@@ -879,8 +1192,11 @@ class EqualOpportunityClassifier(LinearClassifierMixin, BaseEstimator):
         If set to None, no fairness constraint is enforced.
     positive_target : int
         The name of the class which is associated with a positive outcome
-    sensitive_cols : List[str] | List[int] | None, default=None
-        List of sensitive column names (if X is a dataframe) or a list of column indices (if X is a numpy array).
+    sensitive_cols : str | int | List[str] | List[int] | None, default=None
+        Exactly one sensitive column: a column name if `X` is a dataframe (pandas, Polars, ...) or a column index if
+        `X` is an array. The column is always used for the fairness constraint and is part of the design matrix only
+        when `train_sensitive_cols=True`. A missing or unknown column, or more than one declared column, raises a
+        `ValueError` instead of fitting an unconstrained model.
     C : float, default=1.0
         Inverse of regularization strength; must be a positive float. Like in support vector machines, smaller values
         specify stronger regularization.
@@ -892,11 +1208,24 @@ class EqualOpportunityClassifier(LinearClassifierMixin, BaseEstimator):
     max_iter : int, default=100
         Maximum number of iterations taken for the solvers to converge.
     train_sensitive_cols : bool, default=False
-        Indicates whether the model should use the sensitive columns in the fit step.
+        Whether or not to include the sensitive column in the design matrix that is used for prediction. The fairness
+        constraint always uses the original sensitive values, regardless of this setting.
     multi_class : Literal["ovr", "ovo"], default="ovr"
         The method to use for multiclass predictions.
     n_jobs : int | None, default=1
         The amount of parallel jobs that should be used to fit the model.
+
+    Attributes
+    ----------
+    classes_ : ndarray of shape (n_classes,)
+        The classes seen at `fit`.
+    n_features_in_ : int
+        The number of columns of the original input, including the sensitive column when it is not a predictor.
+    feature_names_in_ : ndarray of shape (n_features_in_,)
+        The original column names, only defined when `X` is a dataframe.
+    coef_names_ : list[str] | list[int]
+        The original columns that the coefficients of the fitted binary estimators correspond to, in the same order as
+        the coefficients.
 
     Examples
     --------
@@ -927,7 +1256,7 @@ class EqualOpportunityClassifier(LinearClassifierMixin, BaseEstimator):
     """
 
     def __new__(cls, *args, multi_class="ovr", n_jobs=1, **kwargs):
-        multiclass_meta = {"ovr": OneVsRestClassifier, "ovo": OneVsOneClassifier}[multi_class]
+        multiclass_meta = {"ovr": _FairOneVsRestClassifier, "ovo": _FairOneVsOneClassifier}[multi_class]
         return multiclass_meta(_EqualOpportunityClassifier(*args, **kwargs), n_jobs=n_jobs)
 
 

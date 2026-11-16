@@ -37,8 +37,6 @@ def test_sklearn_compatible_estimator(estimator, check):
         # It passes all steps until score is checked, adding `{"poor_score": True}` doesn't seem to solve or bypass
         # the test
         "check_classifiers_train",
-        "check_n_features_in",  # TODO: This should be fixable?!
-        "check_n_features_in_after_fitting",  # same problem as above, new check in 1.6
     }:
         pytest.skip()
 

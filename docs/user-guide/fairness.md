@@ -226,7 +226,9 @@ $$
 
 Let's see what the effect of this is. As this is a Classifier and not a Regressor, we transform the target to a binary variable indicating whether it is above or below the median. Our p% metric also assumes a binary indicator for sensitive columns so we do the same for our `lstat` column.
 
-Fitting the model is as easy as fitting a normal sklearn model. We just need to supply the columns that should be treated as sensitive to the model, as well as the maximum covariance we want to have.
+Fitting the model is as easy as fitting a normal sklearn model. We just need to supply the column that should be treated as sensitive to the model, as well as the maximum covariance we want to have. Exactly one sensitive column must be declared: a column name when `X` is a dataframe (pandas, Polars, ...) or a column index when `X` is an array. A missing or unknown column, or more than one declared column, raises an error instead of silently skipping the constraint.
+
+The sensitive column is always used for the fairness constraint. Whether it also enters the design matrix used for prediction is controlled by `train_sensitive_cols`: when `False` (the default) it is left out of the prediction, while the constraint still reads the original values. The fitted coefficients line up with the original columns through `coef_names_`, and dataframes may be passed in any column order - they are aligned by name.
 
 ```py title="Demographic Parity Classifier"
 --8<-- "docs/_scripts/fairness.py:demographic-parity"
